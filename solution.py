@@ -27,29 +27,8 @@ from tqdm import tqdm
 import warnings
 warnings.filterwarnings('ignore')
 
-PROJECT_DIR = Path.cwd()
-if not (PROJECT_DIR / 'patches').exists():
-    for name in ('GNR_Project', 'GNR-Project'):
-        candidate = PROJECT_DIR / name
-        if (candidate / 'patches').exists():
-            PROJECT_DIR = candidate
-            break
-
-os.chdir(PROJECT_DIR)
-
-TEST_CSV_PATH = PROJECT_DIR / 'test.csv'
-if not TEST_CSV_PATH.exists():
-    TEST_CSV_PATH = PROJECT_DIR.parent / 'test.csv'
-if not TEST_CSV_PATH.exists():
-    raise FileNotFoundError(f'Could not find test.csv near {PROJECT_DIR}')
-
-PATCH_DIR = 'patches'
 STITCHED_PATH = 'stitched_map.png'
 SUBMISSION_PATH = 'submission.csv'
-
-print('Working directory:', os.getcwd())
-print('Patch folder:', os.path.abspath(PATCH_DIR))
-print('Test CSV:', TEST_CSV_PATH)
 
 """---
 ## Cell 2 — Download Model Weights
@@ -75,16 +54,9 @@ def load_patches(folder):
             patches[idx] = img
     return patches
 
-patches = load_patches(PATCH_DIR)
-N       = len(patches)
-GRID    = int(np.sqrt(N))
-assert GRID * GRID == N, f'Non-square patch count: {N}'
-
-PATCH_H, PATCH_W, _ = patches[0].shape
-print(f'Total patches : {N}')
-print(f'Grid          : {GRID} x {GRID}')
-print(f'Patch size    : {PATCH_H} x {PATCH_W} px')
-print('Final image size is computed after overlap inference.')
+GRID = None
+PATCH_H = None
+PATCH_W = None
 
 """---
 ## Cell 4 — Rotations
@@ -374,9 +346,6 @@ def stitch(patches):
     return [[variants[grid_ids[r][c]]['image'] for c in range(GRID)] for r in range(GRID)], overlap
 
 
-grid, OVERLAP = stitch(patches)
-print('Stitching complete.')
-
 """---
 ## Cell 9 — Merge & Save Stitched Image
 """
@@ -401,26 +370,10 @@ def merge(grid, overlap):
     merged = canvas / np.maximum(weight, 1.0)
     return np.clip(merged, 0, 255).astype(np.uint8)
 
-stitched = merge(grid, OVERLAP)
-Image.fromarray(stitched).save(STITCHED_PATH)
-print(f'Saved {STITCHED_PATH}  shape={stitched.shape}')
-
-plt.figure(figsize=(10, 10))
-plt.imshow(stitched)
-plt.title('Reconstructed Map')
-plt.axis('off')
-plt.tight_layout()
-plt.show()
-
 """---
 ## Cell 10 — Offline QA Helpers
 
 """
-
-from qa_utils import answer_question, clear_qa_cache
-
-clear_qa_cache()
-print('Offline QA helper loaded. It will use the local Qwen2-VL model when needed.')
 
 """---
 ## Cell 12 — Generate Submission
@@ -428,37 +381,6 @@ print('Offline QA helper loaded. It will use the local Qwen2-VL model when neede
 
 # test.csv columns  : id, question, option_1, option_2, option_3, option_4
 # submission columns: id, question_num, option
-
-df = pd.read_csv(TEST_CSV_PATH)
-print(f'Loaded {len(df)} questions from test.csv')
-print(df.head())
-
-answers = []
-
-for _, row in tqdm(df.iterrows(), total=len(df), desc='Answering'):
-    q_id    = row['id']
-    q       = row['question']
-    options = [row['option_1'], row['option_2'], row['option_3'], row['option_4']]
-
-    ans   = answer_question(q, options, stitched)
-    label = options[ans - 1] if ans != 5 else 'SKIP'
-    print(f'  [{q_id}] {q}')
-    print(f'         => {ans} ({label})')
-
-    answers.append({
-        'id'          : q_id,
-        'question_num': q_id,
-        'option'      : ans
-    })
-
-sub = pd.DataFrame(answers)
-
-# Safety check: only 1-5 are valid; anything else is penalised as hallucination
-assert sub['option'].isin([1, 2, 3, 4, 5]).all(), 'Invalid option values detected!'
-
-sub.to_csv(SUBMISSION_PATH, index=False)
-print(f'\n{SUBMISSION_PATH} saved!')
-print(sub)
 
 def run_inference(test_dir):
     import os
@@ -469,11 +391,26 @@ def run_inference(test_dir):
 
     from qa_utils import answer_question, clear_qa_cache
 
-    PROJECT_DIR = Path(test_dir)
+    input_dir = Path(test_dir)
+    if not input_dir.exists():
+        raise FileNotFoundError(f'Could not find test_dir: {input_dir}')
+
+    if input_dir.name in ('images', 'patches'):
+        PROJECT_DIR = input_dir.parent
+        PATCH_DIR = input_dir
+    else:
+        PROJECT_DIR = input_dir
+        PATCH_DIR = PROJECT_DIR / 'images'
+        if not PATCH_DIR.exists():
+            PATCH_DIR = PROJECT_DIR / 'patches'
 
     TEST_CSV_PATH = PROJECT_DIR / 'test.csv'
-    PATCH_DIR = PROJECT_DIR / 'patches'
     SUBMISSION_PATH = 'submission.csv'
+
+    if not PATCH_DIR.exists():
+        raise FileNotFoundError(f'Could not find images directory at {PATCH_DIR}')
+    if not TEST_CSV_PATH.exists():
+        raise FileNotFoundError(f'Could not find test.csv at {TEST_CSV_PATH}')
 
     # ---- load patches ----
     patches = load_patches(PATCH_DIR)
@@ -481,7 +418,9 @@ def run_inference(test_dir):
 
     N = len(patches)
     GRID = int(np.sqrt(N))
-    PATCH_H, PATCH_W, _ = patches[0].shape
+    assert GRID * GRID == N, f'Non-square image count: {N}'
+    first_patch_id = sorted(patches)[0]
+    PATCH_H, PATCH_W, _ = patches[first_patch_id].shape
 
     # ---- stitch ----
     grid, overlap = stitch(patches)
@@ -501,7 +440,11 @@ def run_inference(test_dir):
             row['option_4']
         ]
 
-        ans = answer_question(row['question'], options, stitched)
+        try:
+            ans = answer_question(row['question'], options, stitched)
+        except (RuntimeError, FileNotFoundError, ImportError) as exc:
+            print(f"Could not answer question {row['id']} with VLM: {exc}")
+            ans = 5
 
         answers.append({
             "id": row["id"],
